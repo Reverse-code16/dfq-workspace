@@ -61,6 +61,9 @@ love.image.newImageData = function(...)
     local id = _newImageData(...); shimSelf(id); return id
 end
 
+-- 记录由 ImageData 创建的 Image，getData 返回原始 ImageData
+-- （截图留念链路：newImage(newScreenshot()):getData():encode("png")）
+local imgDataMap = setmetatable({}, {__mode = "k"})
 love.graphics.newImage = function(...)
     local a = ...
     if type(a) == "userdata" then
@@ -69,8 +72,26 @@ love.graphics.newImage = function(...)
     end
     local ok, img = pcall(_newImage, ...)
     if not ok then error(img, 0) end
-    addMethod(img, "getData", function(self) return self end)
+    if type(a) == "userdata" then
+        local _, isID = pcall(a.typeOf, a, "ImageData")
+        if isID then imgDataMap[img] = a end
+    end
+    addMethod(img, "getData", function(self) return imgDataMap[self] or self end)
     return img
+end
+
+-- newScreenshot: 0.10 API，LÖVE 11 已移除（只剩异步 captureScreenshot）。
+-- Boss 死亡时游戏同步截图留念（Shot → newImage(newScreenshot(true)) → Write 存 PNG），
+-- 11 无同步读屏能力，返回透明 ImageData 兜底，保证 Shot/Write 不崩（PNG 内容为空白）。
+if not love.graphics.newScreenshot then
+    love.graphics.newScreenshot = function(copyAlpha)
+        local w, h = love.graphics.getDimensions()
+        local id = _newImageData(w, h)
+        if not copyAlpha then
+            id:mapPixel(function() return 0, 0, 0, 1 end)
+        end
+        return id
+    end
 end
 
 -- draw() accepted raw ImageData/CompressedImageData -> lazily make Image
@@ -174,10 +195,39 @@ local chunk = assert(love.filesystem.load("main_orig.lua"))
 local ok, rerr = xpcall(chunk, function(e) print("ERROR: " .. tostring(e)); print(debug.traceback("", 2)); return e end)
 if not ok then error(rerr, 0) end
 
+-- 技能孔扩展：按键映射表补 skill7~skill10（日志诊断后会挪到 log 定义之后）
+-- 原版 code/anticode 表只到 skill6，触屏按下新孔时 control.PressKey 用 nil 索引写表直接崩溃
+
 -- 调试：写日志到文件
 local function log(msg)
     local f = io.open(love.filesystem.getSaveDirectory() .. "/dfq_debug.log", "a")
     if f then f:write(os.date("%H:%M:%S") .. " " .. tostring(msg) .. "\n") f:close() end
+end
+
+-- 崩溃时把堆栈写进日志（蓝屏信息不留痕，排查困难）
+local _origErrhand = love.errhand
+love.errhand = function(msg)
+    log("FATAL: " .. tostring(msg))
+    log(debug.traceback("", 2))
+    if _origErrhand then return _origErrhand(msg) end
+end
+
+-- 技能孔扩展：按键映射表补 skill7~skill10
+-- 按键表在 config.code（动作→物理键）和 config.anticode（物理键→动作），
+-- 原版只到 skill6，触屏按下 skill7~10 时 code[动作名] 为 nil，
+-- 传入 input.Pressed(nil) 后用 nil 作索引写状态表 → table index is nil 崩溃
+do
+    local cfg = package.loaded["config"]
+    if cfg and cfg.code then
+        local extra = { skill7 = "j", skill8 = "k", skill9 = "l", skill10 = "u" }
+        for name, key in pairs(extra) do
+            if not cfg.code[name] then cfg.code[name] = key end
+            if cfg.anticode and not cfg.anticode[key] then cfg.anticode[key] = name end
+        end
+        log("skill7~10 key bindings added to config.code/anticode")
+    else
+        log("WARNING: config.code not found, skill key bindings NOT applied")
+    end
 end
 
 log("main_orig.lua loaded")
@@ -189,8 +239,7 @@ log("package.loaded['map.init'].Load = " .. tostring(package.loaded["map.init"] 
 -- 必须在 main_orig.lua 加载之后，因为 map.init 是字节码里 require 的
 local _switchPageFn = nil
 local _mapInit = package.loaded["map.init"]
-local DUNGEON_SELECT = {} -- 哨兵：表示应打开副本选择页而非直接进副本
-local _selecting = false  -- 已打开副本选择页时，后续 Make 真正进副本
+local DUNGEON_SELECT = {} -- 哨兵：表示应打开副本选择页而非直接进副本（保留占位，Load 入口防御）
 local _gameStarted = false -- 至少加载过一次游戏地图后，才把 hall 页重定向到 main
 local _mapLoadedOnce = false -- 是否已经真正加载过一张地图（新号开局时还没有）
 local _seriaDirectDone = false -- 新号开局：已直接进入赛利亚房间（跳过洛兰副本）
@@ -241,30 +290,9 @@ if _mapInit and _mapInit.Load then
     end
     log("map.init.Load overridden successfully")
 
-    -- 时空之门右门：type=make map=lorien 时，打开副本选择页而非直接进洛兰
-    if _mapInit.Make then
-        local _origMake = _mapInit.Make
-        _mapInit.Make = function(mapName, e, ...)
-            if mapName == "lorien" and not _selecting then
-                log("Make(lorien) -> open dungeon select page")
-                -- 把玩家移出传送门碰撞区，防止返回后重复触发
-                local _CONFIG = package.loaded["config"]
-                local player = _CONFIG and _CONFIG.user and _CONFIG.user.player
-                if player and player.transform and player.transform.position then
-                    local x, y = player.transform.position:Get()
-                    player.transform.position:Set(x - 150, y)
-                    log("Moved player off collider: " .. tostring(x) .. " -> " .. tostring(x - 150))
-                end
-                _selecting = true
-                if _switchPageFn then _switchPageFn("dungeon") end
-                return DUNGEON_SELECT
-            end
-            _selecting = false
-            log("Make passthrough: " .. tostring(mapName))
-            return _origMake(mapName, e, ...)
-        end
-        log("map.init.Make overridden for dungeon select")
-    end
+    -- 时空之门右门已改用引擎原生 transport.type="dungeon"（见 article/timeGate/pathgate/right.cfg），
+    -- 不再需要劫持 map.init.Make；此前按地图名 lorien 全局拦截会误伤副本内的 make 门
+    -- （导致每次进副本后第一个门被弹回副本选择页）
 else
     log("WARNING: map.init not found in package.loaded")
 end
@@ -277,9 +305,6 @@ for _name, _mod in pairs(package.loaded) do
         _mod.SwitchPage = function(page, ...)
             log("SwitchPage called with: " .. tostring(page))
             _lastPage = page
-            if page == "main" then
-                _selecting = false -- 回到地图页，副本选择流程结束
-            end
             if page == "hall" and _gameStarted then
                 page = "main"
                 log("SwitchPage redirected: hall -> main")

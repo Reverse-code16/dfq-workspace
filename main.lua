@@ -216,8 +216,13 @@ if _mapInit and _mapInit.Load then
         end
         log("map.init.Load called with: " .. tostring(mapName))
         if mapName == "timeGate" then
-            mapName = "seriaRoom"
-            log("Redirecting timeGate -> seriaRoom")
+            if _G._DFQ_BACK_TO_REAL_TG then
+                _G._DFQ_BACK_TO_REAL_TG = false -- 设置页返回城镇：本次保留真时空之门
+                log("Back-to-town flag consumed, keep timeGate")
+            else
+                mapName = "seriaRoom"
+                log("Redirecting timeGate -> seriaRoom")
+            end
         elseif mapName == "timeGate_real" then
             mapName = "timeGate"
             log("Redirecting timeGate_real -> timeGate")
@@ -282,6 +287,22 @@ for _name, _mod in pairs(package.loaded) do
             return _origSwitchPage(page, ...)
         end
         log("SwitchPage overridden in module: " .. tostring(_name))
+    end
+end
+
+-- 设置页“返回标题”改为返回城镇(真时空之门)：BackMenu 复用引擎 BackTown 回城流程(含存档/清理)，
+-- 通过标记让 Load 重定向这一次走 timeGate_real，不影响其它 BackTown 调用者(它们仍回赛利亚房间)
+for _name, _mod in pairs(package.loaded) do
+    if type(_mod) == "table" and type(rawget(_mod, "BackMenu")) == "function"
+        and type(rawget(_mod, "BackTown")) == "function" and not rawget(_mod, "__backMenuHooked") then
+        local _origBackTown = _mod.BackTown
+        _mod.BackMenu = function(...)
+            _G._DFQ_BACK_TO_REAL_TG = true
+            log("BackMenu intercepted -> BackTown to timeGate_real")
+            return _origBackTown(...)
+        end
+        rawset(_mod, "__backMenuHooked", true)
+        log("BackMenu overridden in module: " .. tostring(_name))
     end
 end
 

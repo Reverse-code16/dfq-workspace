@@ -1,0 +1,10 @@
+# 资产目录体积约 985MB，默认不入库；
+# 与原版有差异的资产用 git add -f 强制纳入（已在库的改动会自动跟踪）
+asset/
+
+# 原始字节码，与基线一致，可从 dfq15.love 恢复
+main_orig.lua
+
+# 本地临时文件
+*.bak
+changed.txt

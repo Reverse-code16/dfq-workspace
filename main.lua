@@ -1,4 +1,4 @@
-﻿-- DFQ 1.5 PC compatibility loader (0.10 -> 11.x)
+-- DFQ 1.5 PC compatibility loader (0.10 -> 11.x)
 -- 仅在 LÖVE 11 上应用兼容补丁；安卓 APK 自带 0.10 引擎，打 11 的补丁会导致画面全黑
 local _verMajor = 11
 if love.getVersion then
@@ -190,13 +190,37 @@ end
 
 end -- IS_LOVE11 兼容补丁结束
 
+
+-- LÖVE 11 分辨率适配（必须在 main_orig.lua 之前安装，游戏启动时会缓存这些函数）
+-- Android 上 love.graphics 的绘制坐标系是 dp（如 640x360），但 window.getMode()
+-- 返回物理像素（如 2560x1440）。游戏用 getMode 的像素数计算整体缩放，于是在 dp
+-- 坐标系里被放大约 4 倍并裁切（头像巨大、摇杆和技能栏跑出屏幕）。老 0.10 引擎的
+-- window 和 graphics 都返回物理像素，所以原版没有这个问题。
+-- 让 window 的尺寸 API 与 love.graphics 对齐后，游戏算出的缩放才正确。
+if IS_LOVE11 then
+    local W = love.window
+    local _gdim = love.graphics.getDimensions
+    local gw, gh = _gdim()
+    local pw, ph = gw, gh
+    if love.graphics.getPixelDimensions then
+        pw, ph = love.graphics.getPixelDimensions()
+    end
+    if pw ~= gw or ph ~= gh then
+        W.getMode = function()
+            local w, h = _gdim()
+            return w, h, { fullscreen = true, fullscreentype = "desktop", vsync = 0, msaa = 0, borderless = true, resizable = false, minwidth = 1, minheight = 1 }
+        end
+        W.getWidth = function() return (_gdim()) end
+        W.getHeight = function() local _, h = _gdim(); return h end
+        W.getDimensions = function() return _gdim() end
+        W.getDesktopDimensions = function() return _gdim() end
+    end
+end
+
 -- 加载原版字节码
 local chunk = assert(love.filesystem.load("main_orig.lua"))
 local ok, rerr = xpcall(chunk, function(e) print("ERROR: " .. tostring(e)); print(debug.traceback("", 2)); return e end)
 if not ok then error(rerr, 0) end
-
--- 技能孔扩展：按键映射表补 skill7~skill10（日志诊断后会挪到 log 定义之后）
--- 原版 code/anticode 表只到 skill6，触屏按下新孔时 control.PressKey 用 nil 索引写表直接崩溃
 
 -- 调试：写日志到文件
 local function log(msg)
@@ -208,10 +232,43 @@ end
 local _origErrhand = love.errhand
 love.errhand = function(msg)
     log("FATAL: " .. tostring(msg))
+    local ok2, err2 = pcall(function()
+        for level = 0, 14 do
+            local info = debug.getinfo(level, "Sln")
+            if not info then break end
+            log(string.format("[%d] src=%s cur=%s def=%s-%s what=%s name=%s", level, tostring(info.short_src), tostring(info.currentline), tostring(info.linedefined), tostring(info.lastlinedefined), tostring(info.what), tostring(info.name)))
+            if info.what == "Lua" then
+                for i = 1, 14 do
+                    local n, v = debug.getlocal(level + 1, i)
+                    if not n then break end
+                    local vs = tostring(v)
+                    if #vs > 70 then vs = vs:sub(1, 70) end
+                    log("   local " .. n .. " = " .. vs)
+                end
+            end
+        end
+    end)
+    if not ok2 then log("stackdump failed: " .. tostring(err2)) end
     log(debug.traceback("", 2))
     if _origErrhand then return _origErrhand(msg) end
 end
 
+-- xueqi skill: alias bullet component module to blastBlood's (engine requires module by bullet name)
+do
+    local orig = "actor.component.bullet.swordman.blastBlood"
+    local new = "actor.component.bullet.swordman.xueqi"
+    if not package.preload[new] then
+        package.preload[new] = function()
+            local m = package.loaded[orig]
+            if not m and package.preload[orig] then
+                m = package.preload[orig]()
+                package.loaded[orig] = m
+            end
+            if not m then m = {} end
+            return m
+        end
+    end
+end
 -- 技能孔扩展：按键映射表补 skill7~skill10
 -- 按键表在 config.code（动作→物理键）和 config.anticode（物理键→动作），
 -- 原版只到 skill6，触屏按下 skill7~10 时 code[动作名] 为 nil，
@@ -238,6 +295,7 @@ log("package.loaded['map.init'].Load = " .. tostring(package.loaded["map.init"] 
 -- timeGate_real 哨兵用于从房间直达真实时空之门（避免循环重定向）
 -- 必须在 main_orig.lua 加载之后，因为 map.init 是字节码里 require 的
 local _switchPageFn = nil
+local _backTownFn = nil -- director.BackTown 引用（副本选择页返回时走回城流程用）
 local _mapInit = package.loaded["map.init"]
 local DUNGEON_SELECT = {} -- 哨兵：表示应打开副本选择页而非直接进副本（保留占位，Load 入口防御）
 local _gameStarted = false -- 至少加载过一次游戏地图后，才把 hall 页重定向到 main
@@ -277,7 +335,7 @@ if _mapInit and _mapInit.Load then
             log("Redirecting timeGate_real -> timeGate")
         end
         -- 城镇地图不显示“冒险开始”横幅（config/ui/main/slogan/start.cfg 会读取这个标记）
-        _G._DFQ_MAP_IS_TOWN = (mapName == "seriaRoom" or mapName == "timeGate")
+        _G._DFQ_MAP_IS_TOWN = (mapName == "seriaRoom" or mapName == "timeGate" or mapName == "hellmaton" or mapName == "moonlightTavern")
         local result = _origLoad(mapName, ...)
         _mapLoadedOnce = true
         -- 加载游戏地图后强制切到 main 页，避免返回标题重进时停在 black 页黑屏
@@ -304,8 +362,17 @@ for _name, _mod in pairs(package.loaded) do
         _switchPageFn = _origSwitchPage
         _mod.SwitchPage = function(page, ...)
             log("SwitchPage called with: " .. tostring(page))
+            local _prevPage = _lastPage
             _lastPage = page
             if page == "hall" and _gameStarted then
+                if _prevPage == "dungeon" and _backTownFn then
+                    -- 副本选择页左上返回：角色还站在右门碰撞盒里，hall→main 会让
+                    -- type="dungeon" 传送门立刻重触发，死循环弹回选择页；
+                    -- 改为回城流程重载真时空之门（出生点远离右门）
+                    _G._DFQ_BACK_TO_REAL_TG = true
+                    log("Back from dungeon select -> BackTown to real timeGate")
+                    return _backTownFn()
+                end
                 page = "main"
                 log("SwitchPage redirected: hall -> main")
             end
@@ -321,6 +388,7 @@ for _name, _mod in pairs(package.loaded) do
     if type(_mod) == "table" and type(rawget(_mod, "BackMenu")) == "function"
         and type(rawget(_mod, "BackTown")) == "function" and not rawget(_mod, "__backMenuHooked") then
         local _origBackTown = _mod.BackTown
+        _backTownFn = _origBackTown
         _mod.BackMenu = function(...)
             _G._DFQ_BACK_TO_REAL_TG = true
             log("BackMenu intercepted -> BackTown to timeGate_real")
@@ -355,6 +423,164 @@ local function _installDungeonGoHook()
     log("dungeon.Go overridden for fresh-start seriaRoom")
 end
 
+-- 技能槽扩展：技能界面把可放置槽位名 skill1~skill6 硬编码在闭包 upvalue 的列表里，
+-- 配置新增的 skill7~10 节点因此不会被拖拽落点判定识别（能显示但拖不进去）。
+-- 用 debug.getupvalue 找到该列表并追加后 4 项，不必反编译改字节码。
+local _skillSlotPatched = false
+local function _patchSkillSlotList()
+    if _skillSlotPatched then return end
+    local mod = package.loaded["ui.object.advanced.esc.skill.init"]
+    if type(mod) ~= "table" then mod = package.loaded["ui.object.advanced.esc.skill"] end
+    if type(mod) ~= "table" then return end
+    local function extend(fn)
+        if type(fn) ~= "function" then return false end
+        for i = 1, 60 do
+            local name, val = debug.getupvalue(fn, i)
+            if not name then return false end
+            if type(val) == "table" then
+                local hasSkill1, last = false, 0
+                for j = 1, #val do
+                    local s = val[j]
+                    if type(s) == "string" then
+                        if s == "skill1" then hasSkill1 = true end
+                        local n = tonumber(s:match("^skill(%d+)$"))
+                        if n and n > last then last = n end
+                    end
+                end
+                if hasSkill1 and last < 10 then
+                    for j = last + 1, 10 do val[#val + 1] = "skill" .. j end
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    local hit = false
+    for _, fn in pairs(mod) do
+        if type(fn) == "function" and extend(fn) then hit = true end
+    end
+    if hit then
+        _skillSlotPatched = true
+        log("skill slot list extended to 10")
+    end
+end
+
+-- 备选技能（技能书仓库）从 5 格扩到 10 格：
+-- 技能界面 AdjustList 按 user.bag.skill.max 循环取配置里的 1..max 号格子，
+-- 所以把上限改到 10，并给技能书列表补足 10 项，避免空格子取到 nil。
+local _skillDepotPatched = false
+local function _patchSkillDepot()
+    if _skillDepotPatched then return end
+    local cfg = package.loaded["config"]
+    local u = cfg and cfg.user
+    if type(u) ~= "table" then return end
+    local bag = u.bag and u.bag.skill
+    if type(bag) ~= "table" or type(bag.max) ~= "number" then return end
+    if bag.max >= 10 then
+        _skillDepotPatched = true
+        return
+    end
+    bag.max = 10
+    local lst = bag.list
+    if type(lst) == "table" then
+        local first = nil
+        for i = 1, 20 do
+            local v = lst[i]
+            if v == nil then break end
+            first = first or v
+        end
+        if first then
+            for i = 6, 10 do
+                if lst[i] == nil then
+                    if type(lst.Add) == "function" then pcall(lst.Add, first)
+                    else lst[i] = first end
+                end
+            end
+        end
+    end
+    _skillDepotPatched = true
+    log("skill depot max extended to 10")
+end
+
+-- 装备栏容量：引擎在 user.Ctor 里调用 user.bag.New(event, 5, 6, 5, ...)，
+-- 武器上限 5 / 道具上限 6 / 技能上限 5 是硬编码的。读档时超出上限的装备会被静默丢弃，
+-- 导致移植进来的装备“消失”。这里在构造时把上限放大（技能同步放宽到 10）。
+local _bagCapPatched = false
+local function _patchBagCapacity()
+    if _bagCapPatched then return end
+    local ub = package.loaded["user.bag"]
+    if type(ub) ~= "table" or type(ub.New) ~= "function" then return end
+    local _origNew = ub.New
+    ub.New = function(ev, wmax, smax, kmax, ...)
+        return _origNew(ev, 40, 12, 10, ...)
+    end
+    -- 双保险：user.Load 读档前，直接把已建好的 bag 容器上限改大
+    local um = package.loaded["user"]
+    if type(um) == "table" and type(um.Load) == "function" and not um.__capLoad then
+        local _origLoad = um.Load
+        um.Load = function(...)
+            local cu = package.loaded["config"] and package.loaded["config"].user
+            if type(cu) == "table" and type(cu.bag) == "table" then
+                if type(cu.bag.weapon) == "table" then cu.bag.weapon.max = 40 end
+                if type(cu.bag.suptool) == "table" then cu.bag.suptool.max = 12 end
+                if type(cu.bag.skill) == "table" then cu.bag.skill.max = 10 end
+            end
+            return _origLoad(...)
+        end
+        um.__capLoad = true
+    end
+    _bagCapPatched = true
+    -- 引擎模块加载时可能已经建好 config.user.bag，这里直接改现存容器
+    local cu0 = package.loaded["config"] and package.loaded["config"].user
+    if type(cu0) == "table" and type(cu0.bag) == "table" then
+        if type(cu0.bag.weapon) == "table" then cu0.bag.weapon.max = 40 end
+        if type(cu0.bag.suptool) == "table" then cu0.bag.suptool.max = 12 end
+        if type(cu0.bag.skill) == "table" then cu0.bag.skill.max = 10 end
+    end
+end
+_patchBagCapacity()
+
+-- 初始存档自带“血气爆发 / 不动明王阵”：
+-- 新档的备选技能仓库（user.bag.skill.list）是空的，技能栏也只有普通攻击等基础项。
+-- 玩家对象就绪后把这两个技能补进仓库并自动占用空技能槽；已有存档里已有的不重复添加、不改绑定。
+local _initialSkillSeeded = false
+local INITIAL_SKILLS = { "swordman/xueqi", "swordman/budong" }
+function _seedInitialSkills()
+    local cfg = package.loaded["config"]
+    local u = cfg and cfg.user
+    if type(u) ~= "table" or type(u.player) ~= "table" then return end
+    local p = u.player
+    if type(p.skills) ~= "table" or type(p.skills.container) ~= "table" then return end
+    local resmgr = package.loaded["actor.resmgr"]
+    local svc = package.loaded["actor.service.skill"]
+    local bag = u.bag and u.bag.skill
+    if type(resmgr) ~= "table" or type(resmgr.GetItemData) ~= "function" or type(bag) ~= "table" then return end
+    local list = bag.list
+    if type(list) ~= "table" or type(list.GetLength) ~= "function" then return end
+    for _, path in ipairs(INITIAL_SKILLS) do
+        local found = false
+        for i = 1, list:GetLength() do
+            local e = list:Get(i)
+            if type(e) == "table" and e.path == path then found = true break end
+        end
+        if not found then
+            local ok, data = pcall(resmgr.GetItemData, "skill/" .. path)
+            if ok and type(data) == "table" then
+                local okA, errA = pcall(u.bag.Add, u.bag, data)
+                local ok2, r = false, nil
+                if type(svc) == "table" and type(svc.Add) == "function" then
+                    ok2, r = pcall(svc.Add, p, data)
+                end
+                log(string.format("initial skill added: %s addOk=%s err=%s bindOk=%s slot=%s len=%d",
+                    path, tostring(okA), tostring(errA), tostring(ok2), tostring(r), list:GetLength()))
+            else
+                log("initial skill add failed: " .. path .. " " .. tostring(data))
+            end
+        end
+    end
+    _initialSkillSeeded = true
+end
+
 local _saveDbgHooked = false -- 是否已装好存档调试钩子
 local _installSaveDebug -- 前置声明，供 love.update 包装内调用
 local _origUpdateCb = love.update
@@ -362,6 +588,10 @@ if _origUpdateCb then
     love.update = function(dt)
         if not _dungeonGoHooked then _installDungeonGoHook() end
         if not _saveDbgHooked then _installSaveDebug() end
+        if not _skillSlotPatched then _patchSkillSlotList() end
+        if not _skillDepotPatched then _patchSkillDepot() end
+        if not _bagCapPatched then _patchBagCapacity() end
+        if not _initialSkillSeeded and _gameStarted then _seedInitialSkills() end
         return _origUpdateCb(dt)
     end
     log("love.update wrapped for dungeon.Go hook")

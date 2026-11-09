@@ -302,6 +302,9 @@ local _gameStarted = false -- 至少加载过一次游戏地图后，才把 hall
 local _mapLoadedOnce = false -- 是否已经真正加载过一张地图（新号开局时还没有）
 local _seriaDirectDone = false -- 新号开局：已直接进入赛利亚房间（跳过洛兰副本）
 local _lastPage = nil -- 最近一次切换的界面页，用于确认当前处于新号开局的黑屏流程
+-- 进入赫尔马顿：黑屏转场替换为过场图（实现在文件末尾，这里先声明供 Load 钩子调用）
+local _armHmCutscene = nil
+local _extendHmCutscene = nil
 -- 启动时是否已有存档：有存档=老玩家，首次 dungeon.Go 不做重定向
 local _hadSaveAtLaunch = false
 pcall(function()
@@ -336,7 +339,12 @@ if _mapInit and _mapInit.Load then
         end
         -- 城镇地图不显示“冒险开始”横幅（config/ui/main/slogan/start.cfg 会读取这个标记）
         _G._DFQ_MAP_IS_TOWN = (mapName == "seriaRoom" or mapName == "timeGate" or mapName == "hellmaton" or mapName == "moonlightTavern")
+        local _loadT0 = love.timer.getTime()
+        if mapName == "hellmaton" and _armHmCutscene then _armHmCutscene() end
         local result = _origLoad(mapName, ...)
+        if mapName == "hellmaton" and _extendHmCutscene then
+            _extendHmCutscene(love.timer.getTime() - _loadT0)
+        end
         _mapLoadedOnce = true
         -- 加载游戏地图后强制切到 main 页，避免返回标题重进时停在 black 页黑屏
         if _switchPageFn and mapName ~= "interview" then
@@ -667,3 +675,87 @@ if love.filesystem.newFile then
     end
 end
 log("fs.write hooks installed")
+
+-- ── 进入赫尔马顿：把转场黑屏换成过场图 ─────────────────────────────
+-- 引擎跨地图时用 graphics.curtain 铺满纯黑幕布做转场。这里在 map.init.Load("hellmaton")
+-- 前后点亮一个时间窗，在 love.draw 最上层用 cover 方式铺满过场图（800x600 原图），
+-- 窗口结束时淡出，恢复游戏画面；其他地图/页面切换不受影响。
+local _hmFrom, _hmUntil = 0, 0
+local _hmImg, _hmTried = nil, false
+
+local function _getHmImage()
+    if _hmTried then return _hmImg end
+    _hmTried = true
+    local ok, img = pcall(love.graphics.newImage, "asset/image2/ui/cutscene/hendonmyre.png")
+    if ok and img then
+        _hmImg = img
+        log("Hendon Myre cutscene image loaded " .. tostring(img:getWidth()) .. "x" .. tostring(img:getHeight()))
+    else
+        log("Hendon Myre cutscene image FAILED: " .. tostring(img))
+    end
+    return _hmImg
+end
+
+function _armHmCutscene()
+    local now = love.timer.getTime()
+    _hmFrom = now
+    _hmUntil = now + 0.1 -- 加载期间的保底；加载结束后由 _extendHmCutscene 延长
+end
+
+function _extendHmCutscene(loadDur)
+    local now = love.timer.getTime()
+    -- 覆盖“加载完成后的黑幕淡出”约 0.9 秒
+    _hmUntil = math.max(_hmUntil, now + 0.9)
+    log(string.format("Hendon Myre cutscene window %.0fms (load %.0fms)", (_hmUntil - _hmFrom) * 1000, (loadDur or 0) * 1000))
+end
+
+-- 转场时序日志：确认 map.Load 是否发生在 director.Curtain 同步调用内
+do
+    local d = package.loaded["director"]
+    if type(d) == "table" and type(d.Curtain) == "function" and not d.__hmCurtainDbg then
+        local oc = d.Curtain
+        d.Curtain = function(...)
+            local t0 = love.timer.getTime()
+            log("Curtain begin")
+            local r = oc(...)
+            log(string.format("Curtain end (%.0fms)", (love.timer.getTime() - t0) * 1000))
+            return r
+        end
+        d.__hmCurtainDbg = true
+    end
+end
+
+local _origDrawCb = love.draw
+if _origDrawCb then
+    love.draw = function()
+        _origDrawCb()
+        local now = love.timer.getTime()
+        if now >= _hmUntil then return end
+        local img = _getHmImage()
+        if not img then return end
+        local a = 1
+        local fadeIn = 0.12
+        if now - _hmFrom < fadeIn then a = (now - _hmFrom) / fadeIn end
+        local fadeOut = 0.25
+        local remain = _hmUntil - now
+        if remain < fadeOut then a = math.min(a, remain / fadeOut) end
+        if a < 0 then a = 0 end
+
+        if IS_LOVE11 then love.graphics.push("all") else love.graphics.push() end
+        local sx, sy, sw2, sh2 = love.graphics.getScissor()
+        love.graphics.setScissor()
+        love.graphics.setShader()
+        love.graphics.setBlendMode("alpha")
+        love.graphics.origin()
+        local w, h = love.graphics.getDimensions()
+        local iw, ih = img:getWidth(), img:getHeight()
+        local s = math.max(w / iw, h / ih)
+        local dw, dh = iw * s, ih * s
+        love.graphics.setColor(1, 1, 1, a)
+        love.graphics.draw(img, (w - dw) / 2, (h - dh) / 2, 0, s, s)
+        love.graphics.setColor(1, 1, 1, 1)
+        if sx then love.graphics.setScissor(sx, sy, sw2, sh2) end
+        love.graphics.pop()
+    end
+    log("love.draw wrapped for Hendon Myre cutscene")
+end

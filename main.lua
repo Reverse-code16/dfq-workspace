@@ -192,20 +192,26 @@ end -- IS_LOVE11 兼容补丁结束
 
 
 -- LÖVE 11 分辨率适配（必须在 main_orig.lua 之前安装，游戏启动时会缓存这些函数）
--- Android 上 love.graphics 的绘制坐标系是 dp（如 640x360），但 window.getMode()
--- 返回物理像素（如 2560x1440）。游戏用 getMode 的像素数计算整体缩放，于是在 dp
--- 坐标系里被放大约 4 倍并裁切（头像巨大、摇杆和技能栏跑出屏幕）。老 0.10 引擎的
--- window 和 graphics 都返回物理像素，所以原版没有这个问题。
--- 让 window 的尺寸 API 与 love.graphics 对齐后，游戏算出的缩放才正确。
-if IS_LOVE11 then
-    local W = love.window
-    local _gdim = love.graphics.getDimensions
-    local gw, gh = _gdim()
-    local pw, ph = gw, gh
-    if love.graphics.getPixelDimensions then
-        pw, ph = love.graphics.getPixelDimensions()
+-- 目标：让 11.5 在真机上的表现和原版 0.10 完全一致 —— 两个引擎都以「物理像素」
+-- 作为绘制单位（2670x1200），游戏算出的缩放、留白、UI 位置自然一模一样。
+-- 11.5 默认会按系统 DPI 把绘制坐标换算成 dp（890x400），这也是之前画面比老版
+-- 小一圈/比例不同的根源。优先用 usedpiscale=false 把 DPI 缩放关掉；
+-- 引擎不支持时退回“让 window 尺寸 API 跟 graphics 对齐”的旧方案。
+if IS_LOVE11 and love.system and love.system.getOS and love.system.getOS() == "Android" then
+    local dpi = love.graphics.getDPIScale and love.graphics.getDPIScale() or 1
+    if dpi ~= 1 then
+        local pw, ph = love.graphics.getDimensions()
+        if love.graphics.getPixelDimensions then pw, ph = love.graphics.getPixelDimensions() end
+        pcall(love.window.setMode, pw, ph, {
+            fullscreen = true, fullscreentype = "desktop", usedpiscale = false,
+            vsync = 0, msaa = 0, borderless = true, resizable = false,
+        })
+        dpi = love.graphics.getDPIScale and love.graphics.getDPIScale() or 1
     end
-    if pw ~= gw or ph ~= gh then
+
+    if dpi ~= 1 then
+        local W = love.window
+        local _gdim = love.graphics.getDimensions
         W.getMode = function()
             local w, h = _gdim()
             return w, h, { fullscreen = true, fullscreentype = "desktop", vsync = 0, msaa = 0, borderless = true, resizable = false, minwidth = 1, minheight = 1 }
@@ -302,9 +308,9 @@ local _gameStarted = false -- 至少加载过一次游戏地图后，才把 hall
 local _mapLoadedOnce = false -- 是否已经真正加载过一张地图（新号开局时还没有）
 local _seriaDirectDone = false -- 新号开局：已直接进入赛利亚房间（跳过洛兰副本）
 local _lastPage = nil -- 最近一次切换的界面页，用于确认当前处于新号开局的黑屏流程
--- 进入赫尔马顿：黑屏转场替换为过场图（实现在文件末尾，这里先声明供 Load 钩子调用）
-local _armHmCutscene = nil
-local _extendHmCutscene = nil
+-- 进城转场：把黑屏换成过场图（实现在文件末尾，这里先声明供 Load 钩子调用）
+local _armCutscene = nil
+local _extendCutscene = nil
 -- 启动时是否已有存档：有存档=老玩家，首次 dungeon.Go 不做重定向
 local _hadSaveAtLaunch = false
 pcall(function()
@@ -340,10 +346,10 @@ if _mapInit and _mapInit.Load then
         -- 城镇地图不显示“冒险开始”横幅（config/ui/main/slogan/start.cfg 会读取这个标记）
         _G._DFQ_MAP_IS_TOWN = (mapName == "seriaRoom" or mapName == "timeGate" or mapName == "hellmaton" or mapName == "moonlightTavern")
         local _loadT0 = love.timer.getTime()
-        if mapName == "hellmaton" and _armHmCutscene then _armHmCutscene() end
+        if _armCutscene then _armCutscene(mapName) end
         local result = _origLoad(mapName, ...)
-        if mapName == "hellmaton" and _extendHmCutscene then
-            _extendHmCutscene(love.timer.getTime() - _loadT0)
+        if _extendCutscene then
+            _extendCutscene(love.timer.getTime() - _loadT0)
         end
         _mapLoadedOnce = true
         -- 加载游戏地图后强制切到 main 页，避免返回标题重进时停在 black 页黑屏
@@ -676,37 +682,47 @@ if love.filesystem.newFile then
 end
 log("fs.write hooks installed")
 
--- ── 进入赫尔马顿：把转场黑屏换成过场图 ─────────────────────────────
--- 引擎跨地图时用 graphics.curtain 铺满纯黑幕布做转场。这里在 map.init.Load("hellmaton")
+-- ── 进城转场：把黑屏换成过场图 ─────────────────────────────────
+-- 引擎跨地图时用 graphics.curtain 铺满纯黑幕布做转场。这里在 map.init.Load
 -- 前后点亮一个时间窗，在 love.draw 最上层用 cover 方式铺满过场图（800x600 原图），
 -- 窗口结束时淡出，恢复游戏画面；其他地图/页面切换不受影响。
-local _hmFrom, _hmUntil = 0, 0
-local _hmImg, _hmTried = nil, false
+local _CUTSCENE_FILES = {
+    hellmaton = { file = "asset/image2/ui/cutscene/hendonmyre.png", tag = "Hendon Myre" },
+    timeGate = { file = "asset/image2/ui/cutscene/timegate.png", tag = "Time Gate" },
+}
 
-local function _getHmImage()
-    if _hmTried then return _hmImg end
-    _hmTried = true
-    local ok, img = pcall(love.graphics.newImage, "asset/image2/ui/cutscene/hendonmyre.png")
+local _cutFrom, _cutUntil = 0, 0
+local _cutCfg, _cutImg, _cutTried = nil, nil, false
+
+local function _getCutImage()
+    if _cutTried then return _cutImg end
+    _cutTried = true
+    if not _cutCfg then return nil end
+    local ok, img = pcall(love.graphics.newImage, _cutCfg.file)
     if ok and img then
-        _hmImg = img
-        log("Hendon Myre cutscene image loaded " .. tostring(img:getWidth()) .. "x" .. tostring(img:getHeight()))
+        _cutImg = img
+        log(_cutCfg.tag .. " cutscene image loaded " .. tostring(img:getWidth()) .. "x" .. tostring(img:getHeight()))
     else
-        log("Hendon Myre cutscene image FAILED: " .. tostring(img))
+        log(_cutCfg.tag .. " cutscene image FAILED: " .. tostring(img))
     end
-    return _hmImg
+    return _cutImg
 end
 
-function _armHmCutscene()
+function _armCutscene(mapName)
+    local cfg = _CUTSCENE_FILES[mapName]
+    if not cfg then return end
+    _cutCfg, _cutImg, _cutTried = cfg, nil, false
     local now = love.timer.getTime()
-    _hmFrom = now
-    _hmUntil = now + 0.1 -- 加载期间的保底；加载结束后由 _extendHmCutscene 延长
+    _cutFrom = now
+    _cutUntil = now + 0.1 -- 加载期间的保底；加载结束后由 _extendCutscene 延长
 end
 
-function _extendHmCutscene(loadDur)
+function _extendCutscene(loadDur)
+    if not _cutCfg then return end
     local now = love.timer.getTime()
     -- 覆盖“加载完成后的黑幕淡出”约 0.9 秒
-    _hmUntil = math.max(_hmUntil, now + 0.9)
-    log(string.format("Hendon Myre cutscene window %.0fms (load %.0fms)", (_hmUntil - _hmFrom) * 1000, (loadDur or 0) * 1000))
+    _cutUntil = math.max(_cutUntil, now + 0.9)
+    log(string.format("%s cutscene window %.0fms (load %.0fms)", _cutCfg.tag, (_cutUntil - _cutFrom) * 1000, (loadDur or 0) * 1000))
 end
 
 -- 转场时序日志：确认 map.Load 是否发生在 director.Curtain 同步调用内
@@ -730,14 +746,14 @@ if _origDrawCb then
     love.draw = function()
         _origDrawCb()
         local now = love.timer.getTime()
-        if now >= _hmUntil then return end
-        local img = _getHmImage()
+        if now >= _cutUntil then return end
+        local img = _getCutImage()
         if not img then return end
         local a = 1
         local fadeIn = 0.12
-        if now - _hmFrom < fadeIn then a = (now - _hmFrom) / fadeIn end
+        if now - _cutFrom < fadeIn then a = (now - _cutFrom) / fadeIn end
         local fadeOut = 0.25
-        local remain = _hmUntil - now
+        local remain = _cutUntil - now
         if remain < fadeOut then a = math.min(a, remain / fadeOut) end
         if a < 0 then a = 0 end
 
@@ -757,5 +773,5 @@ if _origDrawCb then
         if sx then love.graphics.setScissor(sx, sy, sw2, sh2) end
         love.graphics.pop()
     end
-    log("love.draw wrapped for Hendon Myre cutscene")
+    log("love.draw wrapped for town cutscene")
 end
